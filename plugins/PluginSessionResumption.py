@@ -28,6 +28,8 @@ from utils.ThreadPool import ThreadPool
 from nassl import SSL_OP_NO_TICKET
 from utils.SSLyzeSSLConnection import create_sslyze_connection
 
+import time
+import re
 
 class PluginSessionResumption(PluginBase.PluginBase):
 
@@ -256,8 +258,43 @@ class PluginSessionResumption(PluginBase.PluginBase):
         if session1_tls_ticket != session2_tls_ticket:
             return (False, 'TLS ticket assigned but not accepted')
 
+        if re.search("DH", self._extract_cipher(session1)):
+            lifetime_hint = self._extract_tls_session_ticket_lifetime_hint(session1)
+            print "Diffie-Hellman key exchange was used. Server advertises TLS ticket lifetime hint of %d. Sleeping 2 * %d seconds to make sure ticket keys are being rotated (https://www.imperialviolet.org/2013/06/27/botchingpfs.html)." % (lifetime_hint, lifetime_hint)
+            time.sleep(1 * lifetime_hint)
+
+            # Try to resume again with the same TLS ticket. This time it should fail. Otherwise the
+            # server is not rotating its TLS ticket keys and forward secrecy is compromised.
+            session3 = self._resume_ssl_session(target, ctx, session1)
+            try: # Recover the TLS ticket
+                session3_tls_ticket = self._extract_tls_session_ticket(session3)
+            except IndexError:
+                return (False, 'TLS ticket not assigned for third attempt.')
+
+            if session3_tls_ticket == session1_tls_ticket:
+                raise Exception('Diffie-Hellman key exchange was used, but TLS ticket keys are not being rotated on the server. Forward secrecy is compromised.')
+
         return (True, '')
     
+    def _extract_cipher(self, ssl_session):
+        """
+        Extracts the cipher for a given SSL session.
+        """
+        m = re.search("Cipher *: *(.*)", ssl_session.as_text())
+        if m:
+          return m.group(1)
+        else:
+          return None
+
+    def _extract_tls_session_ticket_lifetime_hint(self, ssl_session):
+        """
+        Extracts the TLS ticket lifetime hint.
+        """
+        m = re.search("TLS session ticket lifetime hint: ([0-9]+)", ssl_session.as_text())
+        if m:
+          return int(m.group(1))
+        else:
+          return None
     
     def _extract_session_id(self, ssl_session):
         """
